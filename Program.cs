@@ -6,20 +6,24 @@ using MimeKit;
 
 using OtpNet;
 using BC = BCrypt.Net.BCrypt;
+using MySql.Data.MySqlClient;
 
 enum Errors {
     OK,
     INVALID_HEADER,
     INVALID_TOKEN,
     USER_ALREADY_EXISTS,
+    MAIL_ALREADY_EXISTS,
     SKIPPED_STEP,
     EXPIRED,
     TOO_MANY_ATTEMPS,
+    EMAIL_FAIL,
 };
 
 class TempUser {
     public DateTime start;
     public string token;
+    public string mail;
     public long ip;
     public int remaining;
     public Totp totp;
@@ -56,6 +60,9 @@ class Program {
     static System.IO.Stream output;
     static Dictionary<string, TempUser> sessions = new Dictionary<string, TempUser>();
     static string mailPassword;
+    
+    static MySqlConnection sqlCon;
+
 
     static void send_string(string responseString){
         byte[] buffer = System.Text.Encoding.UTF8.GetBytes(responseString);
@@ -119,6 +126,50 @@ class Program {
 	}
 
 	return false;
+    }
+
+
+    static bool chkRowColExists(string col, string val, Errors ret) {
+	try {
+	    var sql = $"SELECT COUNT(1) FROM clients WHERE {col}=@data";
+	    using var cmd = new MySqlCommand(sql, sqlCon);
+
+	    cmd.Parameters.AddWithValue("@data", val);
+	    cmd.Prepare();
+	    using MySqlDataReader rdr = cmd.ExecuteReader();
+	    rdr.Read();
+
+	    int exists = rdr.GetInt32(0);
+	    if(exists == 1) {
+		closeOutput(ret);
+		return true;
+	    }
+	} catch(Exception e) { 
+	    Console.WriteLine(e);
+	    closeOutput(ret);
+	    return true;
+	}
+
+	return false;
+    }
+
+    static bool chkMailExists(string mail) {
+	return chkRowColExists("mail", mail, Errors.MAIL_ALREADY_EXISTS);
+    }
+
+    static bool chkUserExists(string user) {
+	return chkRowColExists("name", user, Errors.USER_ALREADY_EXISTS);
+    }
+
+    static void createAccount(string user, string mail) {
+	var sql = "INSERT INTO clients(name, mail) VALUES (@name, @mail)";
+	using var cmd = new MySqlCommand(sql, sqlCon);
+
+	cmd.Parameters.AddWithValue("@name", user);
+	cmd.Parameters.AddWithValue("@mail", mail);
+
+	cmd.Prepare();
+	cmd.ExecuteNonQuery();
     }
 
     static void post_package(string package){
@@ -208,6 +259,12 @@ class Program {
 	if(chkInvalidHeader(mail))
 	    return;
 
+	if(chkUserExists(user))
+	    return;
+	
+	if(chkMailExists(mail))
+	    return;
+
 	long ip = request.RemoteEndPoint.Address.Address;
 
 	Console.ForegroundColor = ConsoleColor.Cyan;
@@ -215,7 +272,8 @@ class Program {
 	Console.ForegroundColor = ConsoleColor.White;
 
 	TempUser tempUser = new TempUser();
-	tempUser.token = "TEST";
+	tempUser.token = "1234";
+	tempUser.mail = mail;
 	tempUser.ip = ip;
 
 	if(sessions.ContainsKey(user)) {
@@ -228,24 +286,31 @@ class Program {
 	    sessions.Add(user, tempUser);
 	}
 
+/*
+	try {
+	    var message = new MimeMessage();
+	    message.From.Add (new MailboxAddress("noreply", "noreply@basilisk.sh"));
+	    message.To.Add (new MailboxAddress(user, mail));
+	    message.Subject = "Authentication Token";
 
-	var message = new MimeMessage();
-	message.From.Add (new MailboxAddress("noreply", "noreply@basilisk.sh"));
-	message.To.Add (new MailboxAddress(user, "noreply@basilisk.sh"));
-	message.Subject = "Authentication Token";
+	    message.Body = new TextPart("html") {
+		Text = "Provide this token for your account creation: <b>" + tempUser.token + "</b>",
+	    };
 
-	message.Body = new TextPart("html") {
-	    Text = "Provide this token for your account creation: <b>" + tempUser.token + "</b>",
-	};
+	    using (var client = new SmtpClient()) {
+		client.Connect ("smtp.porkbun.com", 587, false);
 
-	var client = new SmtpClient();
-	client.Connect ("smtp.porkbun.com", 587, false);
+		client.Authenticate("noreply@basilisk.sh", mailPassword);
 
-	client.Authenticate("noreply@basilisk.sh", mailPassword);
-
-	client.Send (message);
-	client.Disconnect (true);
-
+		client.Send (message);
+		client.Disconnect (true);
+	    }
+	} catch {
+	    sessions.Remove(user);
+	    closeOutput(Errors.EMAIL_FAIL);
+	    return;
+	}
+*/
 	sessions[user].authStep++;
 	closeOutput(Errors.OK);
     }
@@ -357,6 +422,8 @@ class Program {
 	    return;
 	}
 
+	createAccount(user, sessions[user].mail);
+	sessions.Remove(user);
 	closeOutput(Errors.OK);
     }
 
@@ -384,10 +451,21 @@ class Program {
 
     public static void Main() {
         HttpListener listener = new HttpListener();
-	mailPassword = File.ReadAllText("password.txt");
 
-        listener.Prefixes.Add("http://*:8001/");
+	string[] lines = File.ReadAllLines("secrets.txt");
+	mailPassword = lines[0];
+
+	Console.WriteLine("Connecting to SQL...");
+	string cs = lines[1];
+	sqlCon = new MySqlConnection(cs);
+	sqlCon.Open();
+	Console.WriteLine($"MySQL Version { sqlCon.ServerVersion }");
+
+	int port = 8001;
+        listener.Prefixes.Add("http://*:" + port + "/");
         listener.Start();
+	
+	Console.WriteLine("Listening on port " + port);
 
         while(true){
             listen(listener);
