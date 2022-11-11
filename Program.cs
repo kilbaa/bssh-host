@@ -1,15 +1,72 @@
 ﻿using System.Net;
+
+using MailKit.Net.Smtp;
+using MailKit;
+using MimeKit;
+
+using OtpNet;
 using BC = BCrypt.Net.BCrypt;
+
+enum Errors {
+    OK,
+    INVALID_HEADER,
+    INVALID_TOKEN,
+    USER_ALREADY_EXISTS,
+    SKIPPED_STEP,
+    EXPIRED,
+    TOO_MANY_ATTEMPS,
+};
+
+class TempUser {
+    public DateTime start;
+    public string token;
+    public long ip;
+    public int remaining;
+    public Totp totp;
+
+    public int authStep = 0;
+    public int attempts = 0;
+
+    public TempUser() {
+	start = DateTime.UtcNow;
+
+	var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+	var stringChars = new char[8];
+	var random = new Random();
+
+	for (int i = 0; i < stringChars.Length; i++) {
+	    stringChars[i] = chars[random.Next(chars.Length)];
+	}
+
+	token = new String(stringChars);
+    }
+
+    public bool isExpired() {
+	DateTime now = DateTime.UtcNow;
+	remaining = (int)now.Subtract(start).TotalSeconds;
+
+	return remaining > 120;
+    }
+}
 
 class Program {
     static HttpListenerContext context;
     static HttpListenerRequest request;
     static HttpListenerResponse response;
     static System.IO.Stream output;
+    static Dictionary<string, TempUser> sessions = new Dictionary<string, TempUser>();
+    static string mailPassword;
+
     static void send_string(string responseString){
         byte[] buffer = System.Text.Encoding.UTF8.GetBytes(responseString);
         output.Write(buffer);
     }
+
+    static void send_error(Errors response){
+        byte[] buffer = BitConverter.GetBytes((int)response);
+        output.Write(buffer);
+    }
+
     static void send_package(string package){
         // Pretty simple sends a package by taking all the bytes of the package
         // sending the bytes with a instruction on how to divide them correctly
@@ -22,6 +79,48 @@ class Program {
         output.Write(file);        
         Console.WriteLine("Sent package " + package);
     }
+
+    static bool chkInvalidHeader(string header) {
+	if(header == null) {
+	    Console.WriteLine("    Invalid Header");
+	    closeOutput(Errors.INVALID_HEADER);
+	    return true;
+	}
+
+	return false;
+    }
+
+    static bool chkInvalidSession(string user) {
+	if(!sessions.ContainsKey(user)) {
+	    Console.WriteLine("    Invalid Session");
+	    closeOutput(Errors.INVALID_HEADER); // TODO: INVALID_SESSION
+	    return true;
+	}
+
+	return false;
+    }
+    
+    static bool chkInvalidAuthStep(string user, int step) {
+	if(sessions[user].authStep != step) {
+	    Console.WriteLine("    Tried Skipping Authentication Steps");
+	    closeOutput(Errors.SKIPPED_STEP);
+	    return true;
+	}
+
+	return false;
+    }
+
+    static bool chkExpiredSession(string user) {
+	if(sessions[user].isExpired()) {
+	    Console.WriteLine("    Session Expired");
+	    sessions.Remove(user);
+	    closeOutput(Errors.EXPIRED);
+	    return true;
+	}
+
+	return false;
+    }
+
     static void post_package(string package){
         // wip  Will allow users to post their own packages
 
@@ -40,13 +139,12 @@ class Program {
 
         Console.WriteLine("Posted package " + package);
     }
+
     static string get_pkg(string package){
         // This does some of the raw checking to see that nothing is wrong with the 
         // Package that the user is requesting (for example the user doing something like ..
         // Which would allow them to download random files on the server)
         // Or somehow sending blankspaces or just simply a package that doesnt exist
-
-
         Console.WriteLine(request.Headers["type"]);
         Console.WriteLine("Package name : " + package);
         string full_path = Path.GetFullPath("packages/" + package);
@@ -69,71 +167,231 @@ class Program {
         }
         return "";
     }
-    static void closeOutput(string message){
-        // One of the last things is sending a message with everything that happened and
-        // Then closing streams as to not make any lingering connections
 
-        send_string(message);
-        Console.WriteLine("\nText sent : " + message);
+    static void closeOutput(Errors status){
+	response.ContentLength64 = 4;
+        send_error(status);
         output.Close();
     }
+
+    static void closeOutput(string res){
+	response.ContentLength64 = res.Length;
+        send_string(res);
+        output.Close();
+    }
+
     static bool pass(){
         string? pass = request.Headers["pass"];
 
         if(string.IsNullOrWhiteSpace(pass)){
             return false;
         }
+
         string[] lines = File.ReadAllLines("password.txt");  
         foreach (string line in lines){ 
             if(BC.Verify(pass, line)){
                 return true;
             }
         }
+
         return false;
     }
+
+    static void auth_0() {
+	string? user, mail;
+	user = request.Headers["User"];
+	mail = request.Headers["Mail"];
+
+	if(chkInvalidHeader(user))
+	    return;
+
+	if(chkInvalidHeader(mail))
+	    return;
+
+	long ip = request.RemoteEndPoint.Address.Address;
+
+	Console.ForegroundColor = ConsoleColor.Cyan;
+	Console.WriteLine("AUTHENTICATING \"" + user + "\" " + "(" + ip + ")");
+	Console.ForegroundColor = ConsoleColor.White;
+
+	TempUser tempUser = new TempUser();
+	tempUser.token = "TEST";
+	tempUser.ip = ip;
+
+	if(sessions.ContainsKey(user)) {
+	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip) {
+		closeOutput(Errors.USER_ALREADY_EXISTS);
+		return;
+	    }
+	    sessions[user] = tempUser;
+	} else {
+	    sessions.Add(user, tempUser);
+	}
+
+
+	var message = new MimeMessage();
+	message.From.Add (new MailboxAddress("noreply", "noreply@basilisk.sh"));
+	message.To.Add (new MailboxAddress(user, "noreply@basilisk.sh"));
+	message.Subject = "Authentication Token";
+
+	message.Body = new TextPart("html") {
+	    Text = "Provide this token for your account creation: <b>" + tempUser.token + "</b>",
+	};
+
+	var client = new SmtpClient();
+	client.Connect ("smtp.porkbun.com", 587, false);
+
+	client.Authenticate("noreply@basilisk.sh", mailPassword);
+
+	client.Send (message);
+	client.Disconnect (true);
+
+	sessions[user].authStep++;
+	closeOutput(Errors.OK);
+    }
+
+    static void auth_1() {
+	string? user, toke;
+	user = request.Headers["User"];
+	toke = request.Headers["Toke"];
+
+	if(chkInvalidHeader(user))
+	    return;
+
+	if(chkInvalidSession(user))
+	    return;
+
+	if(chkInvalidAuthStep(user, 1))
+	    return;
+
+	if(chkExpiredSession(user))
+	    return;
+
+	Console.ForegroundColor = ConsoleColor.Cyan;
+	Console.WriteLine("CHECKING EMAIL TOKEN FOR \"" + user + "\"");
+	Console.ForegroundColor = ConsoleColor.White;
+
+	if(sessions[user].token != toke) {
+	    if(++sessions[user].attempts == 3) {
+		sessions.Remove(user);
+		Console.WriteLine("TOO MANY ATTEMPTS!");
+		closeOutput(Errors.TOO_MANY_ATTEMPS);
+		return;
+	    }
+
+	    closeOutput(Errors.INVALID_TOKEN);
+	    return;
+	}
+
+	sessions[user].attempts = 0;
+	sessions[user].authStep++;
+	closeOutput(Errors.OK);
+    }
+
+    static void auth_2() {
+	string? user;
+	user = request.Headers["User"];
+
+	if(chkInvalidHeader(user))
+	    return;
+
+	if(chkInvalidSession(user))
+	    return;
+
+	if(chkInvalidAuthStep(user, 2))
+	    return;
+
+	if(chkExpiredSession(user))
+	    return;
+
+	Console.ForegroundColor = ConsoleColor.Cyan;
+	Console.WriteLine("TOTP FOR \"" + user + "\"");
+	Console.ForegroundColor = ConsoleColor.White;
+
+	var key = KeyGeneration.GenerateRandomKey(20);
+
+	var base32String = Base32Encoding.ToString(key);
+	var base32Bytes = Base32Encoding.ToBytes(base32String);
+
+	var totp = new Totp(base32Bytes);
+	var code = totp.ComputeTotp();
+
+	sessions[user].totp = totp;
+	sessions[user].authStep++;
+
+	closeOutput("\0\0\0\0" + "otpauth://totp/bssh?secret=" + base32String);
+    }
+
+    static void auth_3() {
+	string? user, totp;
+	user = request.Headers["User"];
+	totp = request.Headers["Totp"];
+
+	if(chkInvalidHeader(user))
+	    return;
+
+	if(chkInvalidHeader(totp))
+	    return;
+
+	if(chkInvalidSession(user))
+	    return;
+
+	if(chkInvalidAuthStep(user, 3))
+	    return;
+
+	if(chkExpiredSession(user))
+	    return;
+
+	string totp_cmp = sessions[user].totp.ComputeTotp();
+	totp = totp.Replace(" ", "");
+	bool ok = totp_cmp == totp;
+
+	Console.WriteLine("Comparing: " + totp + " | " + totp_cmp + " (" + (ok ? "CORRECT" : "INCORRECT") + ")");
+
+	if(!ok) {
+	    if(++sessions[user].attempts == 3) {
+		closeOutput(Errors.TOO_MANY_ATTEMPS);
+		return;
+	    }
+	    closeOutput(Errors.INVALID_TOKEN);
+	    return;
+	}
+
+	closeOutput(Errors.OK);
+    }
+
     static void listen(HttpListener listener){
         // Sets up the program to whatever user is requesting a function
         // Figures out what the user wants and sends them on their way :)
-
-        context = listener.GetContext();
+	context = listener.GetContext();
         request = context.Request;
         response = context.Response;
         output = response.OutputStream;
         
-        if(!pass()){ return;}
+	string? type = request.Headers["Type"];
 
-        string? package = request.Headers["name"]; 
-        if(package == null){
-            closeOutput("No package name sent");
-            return;
-        }
-        if(request.HttpMethod == "GET"){ // If the client is requesting something (thereby GET)
-            string message = get_pkg(package);
-            closeOutput(message);
-            return;
-        }
-        if(request.HttpMethod == "POST"){
-            post_package(package);
-            string message = "Package " + package + " posted";
-            closeOutput(message);
-            return;
-        }
-        output.Close();
-        return;
+	switch(type) {
+	    case "auth_0": auth_0(); break;
+	    case "auth_1": auth_1(); break;
+	    case "auth_2": auth_2(); break;
+	    case "auth_3": auth_3(); break;
+
+	    default: break;
+	}
+        
+	return;
     }
+
     public static void Main() {
         HttpListener listener = new HttpListener();
+	mailPassword = File.ReadAllText("password.txt");
 
         listener.Prefixes.Add("http://*:8001/");
-
         listener.Start();
-        int download = 1;
+
         while(true){
-            Console.WriteLine("\n\nListening...                     (" + download + ")\n");
             listen(listener);
-            download++;
         }
         //listener.Close();
-        
     }
-} // bssh get-pkg name
+}

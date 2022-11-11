@@ -2,5 +2,6 @@ bin/*
 obj/*
 packages/*
 
+password.txt
 .DS_Store
-
+mailpass.txt
