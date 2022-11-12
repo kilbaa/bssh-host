@@ -1,4 +1,6 @@
 ﻿using System.Net;
+using System.Text;
+using System.Security.Cryptography;
 
 using MailKit.Net.Smtp;
 using MailKit;
@@ -8,17 +10,54 @@ using OtpNet;
 using BC = BCrypt.Net.BCrypt;
 using MySql.Data.MySqlClient;
 
-enum Errors {
-    OK,
-    INVALID_HEADER,
-    INVALID_TOKEN,
-    USER_ALREADY_EXISTS,
-    MAIL_ALREADY_EXISTS,
-    SKIPPED_STEP,
-    EXPIRED,
-    TOO_MANY_ATTEMPS,
-    EMAIL_FAIL,
+enum OnError {
+    NOTHING = '0',
+    EXIT    = '1',
+    RESTART = '2',
+    RETURN  = '3',
 };
+
+static class ERRS {
+    public static string InvalidUsername() {
+	return (char)OnError.EXIT + "Invalid username";
+    }
+
+    public static string InvalidMail() {
+	return (char)OnError.EXIT + "Invalid mail";
+    }
+
+    public static string InvalidSession() {
+	return (char)OnError.EXIT + "Invalid session";
+    }
+
+    public static string InvalidToken() {
+	return (char)OnError.RETURN + "Invalid token";
+    }
+
+    public static string ExpiredSession() {
+	return (char)OnError.RESTART + "Session has expired";
+    }
+
+    public static string UserAlreadyExists() {
+	return (char)OnError.RESTART + "User already exists";
+    }
+
+    public static string UserDoesntExist() {
+	return (char)OnError.RESTART + "User does not exist";
+    }
+
+    public static string MailAlreadyExists() {
+	return (char)OnError.RESTART + "Mail already registered";
+    }
+
+    public static string AuthStepSkip() {
+	return (char)OnError.EXIT + "Authentication step skipped";
+    }
+
+    public static string TooManyAttempts() {
+	return (char)OnError.EXIT + "Too many failed attempts";
+    }
+}
 
 class TempUser {
     public DateTime start;
@@ -26,23 +65,18 @@ class TempUser {
     public string mail;
     public long ip;
     public int remaining;
-    public Totp totp;
 
+    public Totp totp;
+    public string autoAuth;
+    public string totpBase32;
+    
     public int authStep = 0;
+    public int loginStep = 0;
     public int attempts = 0;
 
     public TempUser() {
 	start = DateTime.UtcNow;
-
-	var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-	var stringChars = new char[8];
-	var random = new Random();
-
-	for (int i = 0; i < stringChars.Length; i++) {
-	    stringChars[i] = chars[random.Next(chars.Length)];
-	}
-
-	token = new String(stringChars);
+	token = Program.Gen128();
     }
 
     public bool isExpired() {
@@ -63,21 +97,21 @@ class Program {
     
     static MySqlConnection sqlCon;
 
+    public static string Gen128() {
+	Aes algo = Aes.Create();
+	algo.KeySize = 128;
+	algo.GenerateKey();
+	return Convert.ToBase64String(algo.Key);
+    }
 
     static void send_string(string responseString){
         byte[] buffer = System.Text.Encoding.UTF8.GetBytes(responseString);
         output.Write(buffer);
     }
 
-    static void send_error(Errors response){
-        byte[] buffer = BitConverter.GetBytes((int)response);
-        output.Write(buffer);
-    }
-
     static void send_package(string package){
         // Pretty simple sends a package by taking all the bytes of the package
         // sending the bytes with a instruction on how to divide them correctly
-
         byte[] file = File.ReadAllBytes("packages/" + package + ".bin");
         string json = File.ReadAllText("packages/" + package + ".json");
         
@@ -88,85 +122,64 @@ class Program {
     }
 
     static bool chkInvalidHeader(string header) {
-	if(header == null) {
-	    Console.WriteLine("    Invalid Header");
-	    closeOutput(Errors.INVALID_HEADER);
-	    return true;
-	}
-
-	return false;
+	return header == null;
     }
 
     static bool chkInvalidSession(string user) {
-	if(!sessions.ContainsKey(user)) {
-	    Console.WriteLine("    Invalid Session");
-	    closeOutput(Errors.INVALID_HEADER); // TODO: INVALID_SESSION
-	    return true;
-	}
-
-	return false;
+	return !sessions.ContainsKey(user);
     }
     
     static bool chkInvalidAuthStep(string user, int step) {
-	if(sessions[user].authStep != step) {
-	    Console.WriteLine("    Tried Skipping Authentication Steps");
-	    closeOutput(Errors.SKIPPED_STEP);
-	    return true;
-	}
-
-	return false;
+	return sessions[user].authStep != step;
     }
 
     static bool chkExpiredSession(string user) {
 	if(sessions[user].isExpired()) {
-	    Console.WriteLine("    Session Expired");
 	    sessions.Remove(user);
-	    closeOutput(Errors.EXPIRED);
 	    return true;
 	}
 
 	return false;
     }
 
+    static bool chkRowColExists(string col, string val) {
+	var sql = $"SELECT COUNT(1) FROM clients WHERE {col}=@data";
+	using var cmd = new MySqlCommand(sql, sqlCon);
 
-    static bool chkRowColExists(string col, string val, Errors ret) {
-	try {
-	    var sql = $"SELECT COUNT(1) FROM clients WHERE {col}=@data";
-	    using var cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@data", val);
+	cmd.Prepare();
+	using MySqlDataReader rdr = cmd.ExecuteReader();
+	rdr.Read();
 
-	    cmd.Parameters.AddWithValue("@data", val);
-	    cmd.Prepare();
-	    using MySqlDataReader rdr = cmd.ExecuteReader();
-	    rdr.Read();
-
-	    int exists = rdr.GetInt32(0);
-	    if(exists == 1) {
-		closeOutput(ret);
-		return true;
-	    }
-	} catch(Exception e) { 
-	    Console.WriteLine(e);
-	    closeOutput(ret);
-	    return true;
-	}
-
-	return false;
+	int exists = rdr.GetInt32(0);
+	return exists == 1;
     }
 
-    static bool chkMailExists(string mail) {
-	return chkRowColExists("mail", mail, Errors.MAIL_ALREADY_EXISTS);
+    static string[] LoginData(string user) {
+	string[] ret = new string[3];
+
+	var sql = $"SELECT auth, totp, mail FROM clients WHERE name=@name";
+	using var cmd = new MySqlCommand(sql, sqlCon);
+	
+	cmd.Parameters.AddWithValue("@name", user);
+	cmd.Prepare();
+	using MySqlDataReader rdr = cmd.ExecuteReader();
+	rdr.Read();
+	ret[0] = rdr.GetString(0);
+	ret[1] = rdr.GetString(1);
+	ret[2] = rdr.GetString(2);
+
+	return ret;
     }
 
-    static bool chkUserExists(string user) {
-	return chkRowColExists("name", user, Errors.USER_ALREADY_EXISTS);
-    }
-
-    static void createAccount(string user, string mail) {
-	var sql = "INSERT INTO clients(name, mail) VALUES (@name, @mail)";
+    static void createAccount(string user, string mail, string authHash, string totpHash) {
+	var sql = "INSERT INTO clients(name, mail, auth, totp) VALUES (@name, @mail, @auth, @totp)";
 	using var cmd = new MySqlCommand(sql, sqlCon);
 
 	cmd.Parameters.AddWithValue("@name", user);
 	cmd.Parameters.AddWithValue("@mail", mail);
+	cmd.Parameters.AddWithValue("@auth", authHash);
+	cmd.Parameters.AddWithValue("@totp", totpHash);
 
 	cmd.Prepare();
 	cmd.ExecuteNonQuery();
@@ -219,12 +232,6 @@ class Program {
         return "";
     }
 
-    static void closeOutput(Errors status){
-	response.ContentLength64 = 4;
-        send_error(status);
-        output.Close();
-    }
-
     static void closeOutput(string res){
 	response.ContentLength64 = res.Length;
         send_string(res);
@@ -248,45 +255,8 @@ class Program {
         return false;
     }
 
-    static void auth_0() {
-	string? user, mail;
-	user = request.Headers["User"];
-	mail = request.Headers["Mail"];
-
-	if(chkInvalidHeader(user))
-	    return;
-
-	if(chkInvalidHeader(mail))
-	    return;
-
-	if(chkUserExists(user))
-	    return;
-	
-	if(chkMailExists(mail))
-	    return;
-
-	long ip = request.RemoteEndPoint.Address.Address;
-
-	Console.ForegroundColor = ConsoleColor.Cyan;
-	Console.WriteLine("AUTHENTICATING \"" + user + "\" " + "(" + ip + ")");
-	Console.ForegroundColor = ConsoleColor.White;
-
-	TempUser tempUser = new TempUser();
-	tempUser.token = "1234";
-	tempUser.mail = mail;
-	tempUser.ip = ip;
-
-	if(sessions.ContainsKey(user)) {
-	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip) {
-		closeOutput(Errors.USER_ALREADY_EXISTS);
-		return;
-	    }
-	    sessions[user] = tempUser;
-	} else {
-	    sessions.Add(user, tempUser);
-	}
-
-/*
+    static void SendConfirmationMail() {
+	/*
 	try {
 	    var message = new MimeMessage();
 	    message.From.Add (new MailboxAddress("noreply", "noreply@basilisk.sh"));
@@ -311,26 +281,117 @@ class Program {
 	    return;
 	}
 */
-	sessions[user].authStep++;
-	closeOutput(Errors.OK);
     }
 
-    static void auth_1() {
+    static string login_0() {
+	string? user;
+	user = request.Headers["User"];
+
+	if(chkInvalidHeader(user))
+	    return ERRS.InvalidUsername();
+
+	if(!chkRowColExists("name", user))
+	    return ERRS.UserDoesntExist();
+
+	string[] loginData = LoginData(user);
+	string auth = loginData[0];
+	string totp = loginData[1];
+	string mail = loginData[2];
+
+	long ip = request.RemoteEndPoint.Address.Address;
+	Console.ForegroundColor = ConsoleColor.Cyan;
+	Console.WriteLine("LOG IN REQUEST \"" + user + "\" " + "(" + ip + ")");
+	Console.ForegroundColor = ConsoleColor.White;
+
+	TempUser tempUser = new TempUser();
+	tempUser.token = "1234";
+	tempUser.mail = mail;
+	tempUser.ip = ip;
+
+	SendConfirmationMail();
+
+	if(sessions.ContainsKey(user)) {
+	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip) {
+		return ERRS.UserAlreadyExists();
+	    }
+	    sessions[user] = tempUser;
+	} else {
+	    sessions.Add(user, tempUser);
+	}
+
+	sessions[user].loginStep++;
+	return (char)OnError.NOTHING + "";
+    }
+
+    static string login_1() {
+    }
+
+    static string auth_0() {
+	string? user, mail;
+	user = request.Headers["User"];
+	mail = request.Headers["Mail"];
+
+	if(chkInvalidHeader(user))
+	    return ERRS.InvalidUsername();
+
+	if(chkInvalidHeader(mail))
+	    return ERRS.InvalidMail();
+
+	if(chkRowColExists("name", user))
+	    return ERRS.UserAlreadyExists();
+	
+	if(chkRowColExists("mail", mail))
+	    return ERRS.MailAlreadyExists();
+
+	long ip = request.RemoteEndPoint.Address.Address;
+	Console.ForegroundColor = ConsoleColor.Cyan;
+	Console.WriteLine("AUTHENTICATING \"" + user + "\" " + "(" + ip + ")");
+	Console.ForegroundColor = ConsoleColor.White;
+
+	TempUser tempUser = new TempUser();
+	tempUser.token = "1234";
+	tempUser.mail = mail;
+	tempUser.ip = ip;
+
+	if(sessions.ContainsKey(user)) {
+	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip) {
+		return ERRS.UserAlreadyExists();
+	    }
+	    sessions[user] = tempUser;
+	} else {
+	    sessions.Add(user, tempUser);
+	}
+
+	SendConfirmationMail();
+
+	Cookie cookie = new Cookie();
+	cookie.Expires = DateTime.UtcNow.AddYears(10);
+	cookie.Name = "auth";
+	cookie.Value = Gen128();
+
+	response.Cookies.Add(cookie);
+	sessions[user].autoAuth = cookie.Value;
+	sessions[user].authStep++;
+
+	return (char)OnError.NOTHING + "";
+    }
+
+    static string auth_1() {
 	string? user, toke;
 	user = request.Headers["User"];
 	toke = request.Headers["Toke"];
 
 	if(chkInvalidHeader(user))
-	    return;
+	    return ERRS.UserAlreadyExists();
 
 	if(chkInvalidSession(user))
-	    return;
+	    return ERRS.InvalidSession();
 
 	if(chkInvalidAuthStep(user, 1))
-	    return;
+	    return ERRS.AuthStepSkip();
 
 	if(chkExpiredSession(user))
-	    return;
+	    return ERRS.ExpiredSession();
 
 	Console.ForegroundColor = ConsoleColor.Cyan;
 	Console.WriteLine("CHECKING EMAIL TOKEN FOR \"" + user + "\"");
@@ -340,34 +401,32 @@ class Program {
 	    if(++sessions[user].attempts == 3) {
 		sessions.Remove(user);
 		Console.WriteLine("TOO MANY ATTEMPTS!");
-		closeOutput(Errors.TOO_MANY_ATTEMPS);
-		return;
+		return ERRS.TooManyAttempts();
 	    }
 
-	    closeOutput(Errors.INVALID_TOKEN);
-	    return;
+	    return ERRS.InvalidToken();
 	}
 
 	sessions[user].attempts = 0;
 	sessions[user].authStep++;
-	closeOutput(Errors.OK);
+	return (char)OnError.NOTHING + "";
     }
 
-    static void auth_2() {
+    static string auth_2() {
 	string? user;
 	user = request.Headers["User"];
 
 	if(chkInvalidHeader(user))
-	    return;
+	    return ERRS.InvalidUsername();
 
 	if(chkInvalidSession(user))
-	    return;
+	    return ERRS.InvalidSession();
 
 	if(chkInvalidAuthStep(user, 2))
-	    return;
+	    return ERRS.AuthStepSkip();
 
 	if(chkExpiredSession(user))
-	    return;
+	    return ERRS.ExpiredSession();
 
 	Console.ForegroundColor = ConsoleColor.Cyan;
 	Console.WriteLine("TOTP FOR \"" + user + "\"");
@@ -382,30 +441,31 @@ class Program {
 	var code = totp.ComputeTotp();
 
 	sessions[user].totp = totp;
+	sessions[user].totpBase32 = base32String;
 	sessions[user].authStep++;
 
-	closeOutput("\0\0\0\0" + "otpauth://totp/bssh?secret=" + base32String);
+	return (char)OnError.NOTHING + "otpauth://totp/bssh?secret=" + base32String;
     }
 
-    static void auth_3() {
+    static string auth_3() {
 	string? user, totp;
 	user = request.Headers["User"];
 	totp = request.Headers["Totp"];
 
 	if(chkInvalidHeader(user))
-	    return;
+	    return ERRS.InvalidUsername();
 
 	if(chkInvalidHeader(totp))
-	    return;
+	    return ERRS.InvalidToken();
 
 	if(chkInvalidSession(user))
-	    return;
+	    return ERRS.InvalidSession();
 
 	if(chkInvalidAuthStep(user, 3))
-	    return;
+	    return ERRS.AuthStepSkip();
 
 	if(chkExpiredSession(user))
-	    return;
+	    return ERRS.ExpiredSession();
 
 	string totp_cmp = sessions[user].totp.ComputeTotp();
 	totp = totp.Replace(" ", "");
@@ -414,17 +474,19 @@ class Program {
 	Console.WriteLine("Comparing: " + totp + " | " + totp_cmp + " (" + (ok ? "CORRECT" : "INCORRECT") + ")");
 
 	if(!ok) {
-	    if(++sessions[user].attempts == 3) {
-		closeOutput(Errors.TOO_MANY_ATTEMPS);
-		return;
-	    }
-	    closeOutput(Errors.INVALID_TOKEN);
-	    return;
+	    if(++sessions[user].attempts == 3)
+		return ERRS.TooManyAttempts();
+
+	    return ERRS.InvalidToken();
 	}
 
-	createAccount(user, sessions[user].mail);
+	string authHash = BC.HashPassword(sessions[user].autoAuth);
+	string totpHash = BC.HashPassword(sessions[user].totpBase32);
+
+	createAccount(user, sessions[user].mail, authHash, totpHash);
 	sessions.Remove(user);
-	closeOutput(Errors.OK);
+
+	return (char)OnError.NOTHING + "";
     }
 
     static void listen(HttpListener listener){
@@ -436,16 +498,21 @@ class Program {
         output = response.OutputStream;
         
 	string? type = request.Headers["Type"];
+	string ret = (char)OnError.NOTHING + "Unknown type";
 
 	switch(type) {
-	    case "auth_0": auth_0(); break;
-	    case "auth_1": auth_1(); break;
-	    case "auth_2": auth_2(); break;
-	    case "auth_3": auth_3(); break;
+	    case "auth_0": ret = auth_0(); break;
+	    case "auth_1": ret = auth_1(); break;
+	    case "auth_2": ret = auth_2(); break;
+	    case "auth_3": ret = auth_3(); break;
+
+	    case "login_0": ret = login_0(); break;
+	    case "login_1": ret = login_1(); break;
 
 	    default: break;
 	}
-        
+
+	closeOutput(ret);
 	return;
     }
 
