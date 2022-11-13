@@ -57,6 +57,10 @@ static class ERRS {
     public static string TooManyAttempts() {
 	return (char)OnError.EXIT + "Too many failed attempts";
     }
+
+    public static string NotLoggedIn() {
+	return (char)OnError.EXIT + "You are not logged in!";
+    }
 }
 
 class TempUser {
@@ -67,7 +71,6 @@ class TempUser {
     public int remaining;
 
     public Totp totp;
-    public string autoAuth;
     public string totpBase32;
     
     public int authStep = 0;
@@ -93,8 +96,10 @@ class Program {
     static HttpListenerResponse response;
     static System.IO.Stream output;
     static Dictionary<string, TempUser> sessions = new Dictionary<string, TempUser>();
-    static string mailPassword;
     
+    static string mailPassword;
+    static byte[] secret;
+
     static MySqlConnection sqlCon;
 
     public static string Gen128() {
@@ -129,8 +134,8 @@ class Program {
 	return !sessions.ContainsKey(user);
     }
     
-    static bool chkInvalidAuthStep(string user, int step) {
-	return sessions[user].authStep != step;
+    static bool chkInvalidAuthStep(int cmp, int step) {
+	return cmp != step;
     }
 
     static bool chkExpiredSession(string user) {
@@ -172,17 +177,64 @@ class Program {
 	return ret;
     }
 
-    static void createAccount(string user, string mail, string authHash, string totpHash) {
-	var sql = "INSERT INTO clients(name, mail, auth, totp) VALUES (@name, @mail, @auth, @totp)";
+    static string[] DataFromUsername(string user, string[] vars) {
+	var sql = $"SELECT ";
+	for(int i = 0; i < vars.Length-1; i++)
+	    sql += (vars[i] + ", ");
+	sql += (vars[vars.Length-1] + " FROM clients WHERE name=@name");
+
+	Console.WriteLine(sql);
 	using var cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@name", user);
+	cmd.Prepare();
+	using MySqlDataReader rdr = cmd.ExecuteReader();
+	rdr.Read();
+
+	List<string> ret = new List<string>();
+	for(int i = 0; i < vars.Length; i++)
+	    ret.Add(rdr.GetString(i));
+
+	return ret.ToArray();
+    }
+
+    static void CreateAccount(int ip, string user, string mail, string authHash, string totpHash) {
+	MySqlCommand cmd;
+	string sql;
+
+	sql = "INSERT INTO clients(name, mail, totp) VALUES (@name, @mail, @totp)";
+	cmd = new MySqlCommand(sql, sqlCon);
 
 	cmd.Parameters.AddWithValue("@name", user);
 	cmd.Parameters.AddWithValue("@mail", mail);
-	cmd.Parameters.AddWithValue("@auth", authHash);
 	cmd.Parameters.AddWithValue("@totp", totpHash);
 
 	cmd.Prepare();
 	cmd.ExecuteNonQuery();
+
+	sql = "INSERT INTO auths(ip, name, auth) VALUES (@ip, @name, @auth)";
+	cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@ip"  , ip);
+	cmd.Parameters.AddWithValue("@name", user);
+	cmd.Parameters.AddWithValue("@auth", authHash);
+
+	cmd.Prepare();
+	cmd.ExecuteNonQuery();
+    }
+
+    static string GetCookieAuth(int ip, string user) {
+	MySqlCommand cmd;
+	string sql;
+
+	sql = "SELECT auth FROM auths WHERE (name=@name) AND (ip=@ip)";
+	cmd = new MySqlCommand(sql, sqlCon);
+
+	cmd.Parameters.AddWithValue("@name", user);
+	cmd.Parameters.AddWithValue("@ip"  , ip);
+
+	cmd.Prepare();
+	MySqlDataReader rdr = cmd.ExecuteReader();
+	rdr.Read();
+	return rdr.GetString(0);
     }
 
     static void post_package(string package){
@@ -293,10 +345,8 @@ class Program {
 	if(!chkRowColExists("name", user))
 	    return ERRS.UserDoesntExist();
 
-	string[] loginData = LoginData(user);
-	string auth = loginData[0];
-	string totp = loginData[1];
-	string mail = loginData[2];
+	string[] data = DataFromUsername(user, new string[] { "mail" });
+	string mail = data[0];
 
 	long ip = request.RemoteEndPoint.Address.Address;
 	Console.ForegroundColor = ConsoleColor.Cyan;
@@ -324,6 +374,80 @@ class Program {
     }
 
     static string login_1() {
+	string? user, toke;
+	user = request.Headers["User"];
+	toke = request.Headers["Toke"];
+
+	if(chkInvalidHeader(user))
+	    return ERRS.UserAlreadyExists();
+
+	if(chkInvalidSession(user))
+	    return ERRS.InvalidSession();
+
+	if(chkInvalidAuthStep(sessions[user].loginStep, 1))
+	    return ERRS.AuthStepSkip();
+
+	if(chkExpiredSession(user))
+	    return ERRS.ExpiredSession();
+
+	Console.ForegroundColor = ConsoleColor.Cyan;
+	Console.WriteLine("CHECKING EMAIL TOKEN FOR \"" + user + "\"");
+	Console.ForegroundColor = ConsoleColor.White;
+
+	if(sessions[user].token != toke) {
+	    if(++sessions[user].attempts == 3) {
+		sessions.Remove(user);
+		Console.WriteLine("TOO MANY ATTEMPTS!");
+		return ERRS.TooManyAttempts();
+	    }
+
+	    return ERRS.InvalidToken();
+	}
+
+	sessions[user].attempts = 0;
+	sessions[user].loginStep++;
+
+	return (char)OnError.NOTHING + "";
+    }
+
+    static string login_2() {
+	string? user, totp;
+	user = request.Headers["User"];
+	totp = request.Headers["Totp"];
+
+	if(chkInvalidHeader(user))
+	    return ERRS.UserAlreadyExists();
+
+	if(chkInvalidSession(user))
+	    return ERRS.InvalidSession();
+
+	if(chkInvalidAuthStep(sessions[user].loginStep, 2))
+	    return ERRS.AuthStepSkip();
+
+	if(chkExpiredSession(user))
+	    return ERRS.ExpiredSession();
+
+	string[] data = DataFromUsername(user, new string[] { "totp" });
+	string totpEncrypted = data[0];
+
+	Aes aes = Aes.Create();
+	aes.KeySize = 128;
+	aes.Key = secret;
+
+	byte[] totpKey = aes.DecryptEcb(Convert.FromBase64String(totpEncrypted), PaddingMode.ANSIX923);
+
+	var totp_cmp = new Totp(totpKey);
+	var code = totp_cmp.ComputeTotp();
+	bool ok = code == totp;
+
+	if(!ok) {
+	    if(++sessions[user].attempts == 3)
+		return ERRS.TooManyAttempts();
+
+	    return ERRS.InvalidToken();
+	}
+
+	return (char)OnError.NOTHING + "";
     }
 
     static string auth_0() {
@@ -364,15 +488,7 @@ class Program {
 
 	SendConfirmationMail();
 
-	Cookie cookie = new Cookie();
-	cookie.Expires = DateTime.UtcNow.AddYears(10);
-	cookie.Name = "auth";
-	cookie.Value = Gen128();
-
-	response.Cookies.Add(cookie);
-	sessions[user].autoAuth = cookie.Value;
 	sessions[user].authStep++;
-
 	return (char)OnError.NOTHING + "";
     }
 
@@ -387,7 +503,7 @@ class Program {
 	if(chkInvalidSession(user))
 	    return ERRS.InvalidSession();
 
-	if(chkInvalidAuthStep(user, 1))
+	if(chkInvalidAuthStep(sessions[user].authStep, 1))
 	    return ERRS.AuthStepSkip();
 
 	if(chkExpiredSession(user))
@@ -422,7 +538,7 @@ class Program {
 	if(chkInvalidSession(user))
 	    return ERRS.InvalidSession();
 
-	if(chkInvalidAuthStep(user, 2))
+	if(chkInvalidAuthStep(sessions[user].authStep, 2))
 	    return ERRS.AuthStepSkip();
 
 	if(chkExpiredSession(user))
@@ -461,7 +577,7 @@ class Program {
 	if(chkInvalidSession(user))
 	    return ERRS.InvalidSession();
 
-	if(chkInvalidAuthStep(user, 3))
+	if(chkInvalidAuthStep(sessions[user].authStep, 3))
 	    return ERRS.AuthStepSkip();
 
 	if(chkExpiredSession(user))
@@ -480,18 +596,73 @@ class Program {
 	    return ERRS.InvalidToken();
 	}
 
-	string authHash = BC.HashPassword(sessions[user].autoAuth);
-	string totpHash = BC.HashPassword(sessions[user].totpBase32);
+	/* Generate 128 bit password and send to client as cookie */
+	Cookie authCookie = new Cookie();
+	authCookie.Expires = DateTime.UtcNow.AddYears(10);
+	authCookie.Name = "auth";
+	authCookie.Value = Gen128();
 
-	createAccount(user, sessions[user].mail, authHash, totpHash);
+	Cookie userCookie = new Cookie();
+	userCookie.Name = "user";
+	userCookie.Value = user;
+
+	response.Cookies.Add(authCookie);
+	response.Cookies.Add(userCookie);
+
+	/* Hash the 128 bit password */
+	string authHash = BC.HashPassword(authCookie.Value);
+
+	/* Encrypt TOTP secret */
+	Aes aes = Aes.Create();
+	aes.KeySize = 128;
+	aes.Key = secret;
+
+	byte[] totpBytes = Base32Encoding.ToBytes(sessions[user].totpBase32);
+	string encrypt64 = Convert.ToBase64String(aes.EncryptEcb(totpBytes, PaddingMode.ANSIX923));
+
+	CreateAccount((int)sessions[user].ip, user, sessions[user].mail, authHash, encrypt64);
+
 	sessions.Remove(user);
+	return (char)OnError.NOTHING + "";
+    }
+
+    static bool AutoLogin(out string outUser) {
+	string? user, auth;
+
+	user = request.Cookies["user"].Value;
+	auth = request.Cookies["auth"].Value;
+
+	outUser = user;
+	if(chkInvalidHeader(user))
+	    return false;
+
+	if(chkInvalidHeader(auth))
+	    return false;
+
+	int ip = (int)request.RemoteEndPoint.Address.Address;
+	string cmpAuth = GetCookieAuth(ip, user);
+
+	bool ok = BC.Verify(auth, cmpAuth);
+
+	return ok;
+    }
+
+    static string Befriend() {
+	bool loggedIn = AutoLogin(out var user);
+	if(!loggedIn)
+	    return ERRS.NotLoggedIn();
+
+	string? friend;
+	friend = request.Headers["Friend"];
+
+	Console.ForegroundColor = ConsoleColor.Cyan;
+	Console.WriteLine(user + " sent a friend request to " + friend);
+	Console.ForegroundColor = ConsoleColor.White;
 
 	return (char)OnError.NOTHING + "";
     }
 
     static void listen(HttpListener listener){
-        // Sets up the program to whatever user is requesting a function
-        // Figures out what the user wants and sends them on their way :)
 	context = listener.GetContext();
         request = context.Request;
         response = context.Response;
@@ -500,17 +671,21 @@ class Program {
 	string? type = request.Headers["Type"];
 	string ret = (char)OnError.NOTHING + "Unknown type";
 
-	switch(type) {
-	    case "auth_0": ret = auth_0(); break;
-	    case "auth_1": ret = auth_1(); break;
-	    case "auth_2": ret = auth_2(); break;
-	    case "auth_3": ret = auth_3(); break;
+	try {
+	    switch(type) {
+		case "auth_0": ret = auth_0(); break;
+		case "auth_1": ret = auth_1(); break;
+		case "auth_2": ret = auth_2(); break;
+		case "auth_3": ret = auth_3(); break;
 
-	    case "login_0": ret = login_0(); break;
-	    case "login_1": ret = login_1(); break;
+		case "login_0": ret = login_0(); break;
+		case "login_1": ret = login_1(); break;
+		case "login_2": ret = login_2(); break;
 
-	    default: break;
-	}
+		case "befriend": ret = Befriend(); break;
+		default: break;
+	    }
+	} catch {};
 
 	closeOutput(ret);
 	return;
@@ -521,9 +696,10 @@ class Program {
 
 	string[] lines = File.ReadAllLines("secrets.txt");
 	mailPassword = lines[0];
+	secret = Encoding.UTF8.GetBytes(lines[1]);
 
 	Console.WriteLine("Connecting to SQL...");
-	string cs = lines[1];
+	string cs = lines[2];
 	sqlCon = new MySqlConnection(cs);
 	sqlCon.Open();
 	Console.WriteLine($"MySQL Version { sqlCon.ServerVersion }");
