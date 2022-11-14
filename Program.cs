@@ -1,5 +1,6 @@
 ﻿using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Security.Cryptography;
 
 using MailKit.Net.Smtp;
@@ -15,6 +16,11 @@ enum OnError {
     EXIT    = '1',
     RESTART = '2',
     RETURN  = '3',
+};
+
+enum FriendType : byte {
+    REQUEST,
+    FRIENDS,
 };
 
 static class ERRS {
@@ -59,7 +65,27 @@ static class ERRS {
     }
 
     public static string NotLoggedIn() {
-	return (char)OnError.EXIT + "You are not logged in!";
+	return (char)OnError.EXIT + "You need to log in to an account to perform this";
+    }
+
+    public static string NotAlphaNumerical() {
+	return (char)OnError.RESTART + "Name can only contain alphanumerical letters";
+    }
+
+    public static string UserNotFound() {
+	return (char)OnError.EXIT + "User was not found";
+    }
+
+    public static string FriendReqAlreadySent() {
+	return (char)OnError.EXIT + "Friend request already sent";
+    }
+
+    public static string Unknown() {
+	return (char)OnError.EXIT + "Unknown error occured";
+    }
+
+    public static string CouldNotSendMail() {
+	return (char)OnError.EXIT + "Could not send mail";
     }
 }
 
@@ -97,6 +123,8 @@ class Program {
     static System.IO.Stream output;
     static Dictionary<string, TempUser> sessions = new Dictionary<string, TempUser>();
     
+    static readonly Regex alphanumRegex = new Regex("^[a-zA-Z0-9]*$");
+
     static string mailPassword;
     static byte[] secret;
 
@@ -147,6 +175,10 @@ class Program {
 	return false;
     }
 
+    static bool chkIsNotAlphaNum(string str) {
+	return !alphanumRegex.IsMatch(str);
+    }
+
     static bool chkRowColExists(string col, string val) {
 	var sql = $"SELECT COUNT(1) FROM clients WHERE {col}=@data";
 	using var cmd = new MySqlCommand(sql, sqlCon);
@@ -158,6 +190,10 @@ class Program {
 
 	int exists = rdr.GetInt32(0);
 	return exists == 1;
+    }
+
+    static bool chkInvalidEmail(string mail) {
+	return !mail.Contains('@');
     }
 
     static string[] LoginData(string user) {
@@ -211,10 +247,12 @@ class Program {
 	cmd.Prepare();
 	cmd.ExecuteNonQuery();
 
-	sql = "INSERT INTO auths(ip, name, auth) VALUES (@ip, @name, @auth)";
+	int id = GetUserIDS(new string[] { user })[0];
+
+	sql = "INSERT INTO auths VALUES (@id, @ip, @auth)";
 	cmd = new MySqlCommand(sql, sqlCon);
-	cmd.Parameters.AddWithValue("@ip"  , ip);
-	cmd.Parameters.AddWithValue("@name", user);
+	cmd.Parameters.AddWithValue("@id", id);
+	cmd.Parameters.AddWithValue("@ip", ip);
 	cmd.Parameters.AddWithValue("@auth", authHash);
 
 	cmd.Prepare();
@@ -223,18 +261,18 @@ class Program {
 
     static string GetCookieAuth(int ip, string user) {
 	MySqlCommand cmd;
-	string sql;
+	string sql, auth;
 
-	sql = "SELECT auth FROM auths WHERE (name=@name) AND (ip=@ip)";
+	int id = GetUserIDS(new string[] { user })[0];
+
+	sql = "SELECT auth FROM auths WHERE id=@id AND ip=@ip";
 	cmd = new MySqlCommand(sql, sqlCon);
 
-	cmd.Parameters.AddWithValue("@name", user);
-	cmd.Parameters.AddWithValue("@ip"  , ip);
+	cmd.Parameters.AddWithValue("@id", id);
+	cmd.Parameters.AddWithValue("@ip", ip);
 
-	cmd.Prepare();
-	MySqlDataReader rdr = cmd.ExecuteReader();
-	rdr.Read();
-	return rdr.GetString(0);
+	auth = (string)cmd.ExecuteScalar();
+	return auth;
     }
 
     static void post_package(string package){
@@ -307,8 +345,7 @@ class Program {
         return false;
     }
 
-    static void SendConfirmationMail() {
-	/*
+    static string SendConfirmationMail(string user, string mail, string token) {
 	try {
 	    var message = new MimeMessage();
 	    message.From.Add (new MailboxAddress("noreply", "noreply@basilisk.sh"));
@@ -316,7 +353,7 @@ class Program {
 	    message.Subject = "Authentication Token";
 
 	    message.Body = new TextPart("html") {
-		Text = "Provide this token for your account creation: <b>" + tempUser.token + "</b>",
+		Text = "Provide this token for your account creation: <b>" + token + "</b>",
 	    };
 
 	    using (var client = new SmtpClient()) {
@@ -329,10 +366,10 @@ class Program {
 	    }
 	} catch {
 	    sessions.Remove(user);
-	    closeOutput(Errors.EMAIL_FAIL);
-	    return;
+	    return ERRS.CouldNotSendMail();
 	}
-*/
+
+	return (char)OnError.NOTHING + "";
     }
 
     static string login_0() {
@@ -354,11 +391,10 @@ class Program {
 	Console.ForegroundColor = ConsoleColor.White;
 
 	TempUser tempUser = new TempUser();
-	tempUser.token = "1234";
 	tempUser.mail = mail;
 	tempUser.ip = ip;
 
-	SendConfirmationMail();
+	SendConfirmationMail(user, mail, tempUser.token);
 
 	if(sessions.ContainsKey(user)) {
 	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip) {
@@ -391,7 +427,7 @@ class Program {
 	    return ERRS.ExpiredSession();
 
 	Console.ForegroundColor = ConsoleColor.Cyan;
-	Console.WriteLine("CHECKING EMAIL TOKEN FOR \"" + user + "\"");
+	Console.WriteLine("COMPARING EMAIL TOKEN \"" + sessions[user].token + "\" WITH \"" + toke + "\"");
 	Console.ForegroundColor = ConsoleColor.White;
 
 	if(sessions[user].token != toke) {
@@ -461,6 +497,12 @@ class Program {
 	if(chkInvalidHeader(mail))
 	    return ERRS.InvalidMail();
 
+	if(chkInvalidEmail(mail))
+	    return ERRS.InvalidMail();
+
+	if(chkIsNotAlphaNum(user))
+	    return ERRS.NotAlphaNumerical();
+
 	if(chkRowColExists("name", user))
 	    return ERRS.UserAlreadyExists();
 	
@@ -473,7 +515,6 @@ class Program {
 	Console.ForegroundColor = ConsoleColor.White;
 
 	TempUser tempUser = new TempUser();
-	tempUser.token = "1234";
 	tempUser.mail = mail;
 	tempUser.ip = ip;
 
@@ -486,7 +527,7 @@ class Program {
 	    sessions.Add(user, tempUser);
 	}
 
-	SendConfirmationMail();
+	SendConfirmationMail(user, mail, tempUser.token);
 
 	sessions[user].authStep++;
 	return (char)OnError.NOTHING + "";
@@ -510,7 +551,7 @@ class Program {
 	    return ERRS.ExpiredSession();
 
 	Console.ForegroundColor = ConsoleColor.Cyan;
-	Console.WriteLine("CHECKING EMAIL TOKEN FOR \"" + user + "\"");
+	Console.WriteLine("COMPARING EMAIL TOKEN \"" + sessions[user].token + "\" WITH \"" + toke + "\"");
 	Console.ForegroundColor = ConsoleColor.White;
 
 	if(sessions[user].token != toke) {
@@ -647,6 +688,58 @@ class Program {
 	return ok;
     }
 
+    static bool UserHasSentFriendRequest(int sender, int recipient) {
+	string sql;
+	MySqlCommand cmd;
+	MySqlDataReader rdr;
+
+	sql = $"SELECT COUNT(DISTINCT sender) FROM friendreqs WHERE sender=@sender AND recipient=@recipient";
+
+	cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@sender"   , sender);
+	cmd.Parameters.AddWithValue("@recipient", recipient);
+
+	cmd.Prepare();
+	cmd.ExecuteReader();
+	
+	rdr = cmd.ExecuteReader();
+	rdr.Read();
+
+	return rdr.GetInt32(0) == 1;
+    }
+
+    static int[] GetUserIDS(string[] names) {
+	string sql;
+	MySqlCommand cmd;
+	int[] ret = new int[names.Length];
+	
+	sql = $"SELECT id FROM clients WHERE name=@name";
+	cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@name", names[0]);
+	ret[0] = (int)cmd.ExecuteScalar();
+	for(int i = 1; i < names.Length; i++) {
+	    cmd.Parameters[0].Value = names[i];
+	    ret[i] = (int)cmd.ExecuteScalar();
+	}
+
+	return ret;
+    }
+
+    static void AcceptFriendRequest(int sender, int recipient) {
+	string sql;
+	MySqlCommand cmd;
+
+	sql = $"UPDATE friends SET type=@type WHERE user0=@user0 AND user1=@user1";
+
+	cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@type" , (sbyte)FriendType.FRIENDS);
+	cmd.Parameters.AddWithValue("@user0", sender);
+	cmd.Parameters.AddWithValue("@user1", recipient);
+	cmd.ExecuteNonQuery();
+	
+	Console.WriteLine(sender + " and " + recipient + " are now friends");
+    }
+
     static string Befriend() {
 	bool loggedIn = AutoLogin(out var user);
 	if(!loggedIn)
@@ -659,7 +752,61 @@ class Program {
 	Console.WriteLine(user + " sent a friend request to " + friend);
 	Console.ForegroundColor = ConsoleColor.White;
 
-	return (char)OnError.NOTHING + "";
+	/* Get user IDs */
+	int senderID, recipientID;
+
+	try {
+	    int[] IDs = GetUserIDS(new string[] { user, friend });
+	    senderID = IDs[0];
+	    recipientID = IDs[1];
+	} catch {
+	    return ERRS.UserNotFound();
+	}
+
+	/* Check if request already exists */
+	string sql;
+	MySqlCommand cmd;
+	int user0, user1;
+	sbyte type;
+
+	sql = $"SELECT * FROM friends WHERE user0=@sender AND user1=@recipient OR user1=@sender AND user0=@recipient";
+
+	cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@sender"   , senderID);
+	cmd.Parameters.AddWithValue("@recipient", recipientID);
+
+	using MySqlDataReader rdr = cmd.ExecuteReader();
+	if(rdr.HasRows) {
+	    rdr.Read();
+	    user0 = rdr.GetInt32(0);
+	    user1 = rdr.GetInt32(1);
+	    type  = rdr.GetSByte(2);
+	    rdr.Close();
+
+	    /* If same user sent same request more than once */
+	    if(user0 == senderID) {
+		Console.WriteLine("Request already sent");
+		return ERRS.FriendReqAlreadySent();
+	    }
+
+	    /* Create a friendship if both parties have sent a friend request to eachother */
+	    AcceptFriendRequest(user0, user1);
+	    return (char)OnError.NOTHING + "1";
+	}
+	rdr.Close();
+
+	/* Create friend request */
+	Console.WriteLine("Sending friend request...");
+	sql = $"INSERT INTO friends VALUES(@sender, @recipient, @type)";
+	
+	cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@sender"   , senderID);
+	cmd.Parameters.AddWithValue("@recipient", recipientID);
+	cmd.Parameters.AddWithValue("@type", (sbyte)FriendType.REQUEST);
+	cmd.ExecuteNonQuery();
+	Console.WriteLine("Sent!");
+
+	return (char)OnError.NOTHING + "0";
     }
 
     static void listen(HttpListener listener){
@@ -667,7 +814,8 @@ class Program {
         request = context.Request;
         response = context.Response;
         output = response.OutputStream;
-        
+
+	Console.WriteLine("test");
 	string? type = request.Headers["Type"];
 	string ret = (char)OnError.NOTHING + "Unknown type";
 
@@ -704,8 +852,8 @@ class Program {
 	sqlCon.Open();
 	Console.WriteLine($"MySQL Version { sqlCon.ServerVersion }");
 
-	int port = 8001;
-        listener.Prefixes.Add("http://*:" + port + "/");
+	int port = 8005;
+        listener.Prefixes.Add("http://192.168.10.189:" + port + "/");
         listener.Start();
 	
 	Console.WriteLine("Listening on port " + port);
