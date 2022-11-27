@@ -1,4 +1,5 @@
 ﻿using System.Net;
+using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Security.Cryptography;
@@ -23,70 +24,23 @@ enum FriendType : byte {
     FRIENDS,
 };
 
-static class ERRS {
-    public static string InvalidUsername() {
-	return (char)OnError.EXIT + "Invalid username";
-    }
-
-    public static string InvalidMail() {
-	return (char)OnError.EXIT + "Invalid mail";
-    }
-
-    public static string InvalidSession() {
-	return (char)OnError.EXIT + "Invalid session";
-    }
-
-    public static string InvalidToken() {
-	return (char)OnError.RETURN + "Invalid token";
-    }
-
-    public static string ExpiredSession() {
-	return (char)OnError.RESTART + "Session has expired";
-    }
-
-    public static string UserAlreadyExists() {
-	return (char)OnError.RESTART + "User already exists";
-    }
-
-    public static string UserDoesntExist() {
-	return (char)OnError.RESTART + "User does not exist";
-    }
-
-    public static string MailAlreadyExists() {
-	return (char)OnError.RESTART + "Mail already registered";
-    }
-
-    public static string AuthStepSkip() {
-	return (char)OnError.EXIT + "Authentication step skipped";
-    }
-
-    public static string TooManyAttempts() {
-	return (char)OnError.EXIT + "Too many failed attempts";
-    }
-
-    public static string NotLoggedIn() {
-	return (char)OnError.EXIT + "You need to log in to an account to perform this";
-    }
-
-    public static string NotAlphaNumerical() {
-	return (char)OnError.RESTART + "Name can only contain alphanumerical letters";
-    }
-
-    public static string UserNotFound() {
-	return (char)OnError.EXIT + "User was not found";
-    }
-
-    public static string FriendReqAlreadySent() {
-	return (char)OnError.EXIT + "Friend request already sent";
-    }
-
-    public static string Unknown() {
-	return (char)OnError.EXIT + "Unknown error occured";
-    }
-
-    public static string CouldNotSendMail() {
-	return (char)OnError.EXIT + "Could not send mail";
-    }
+public static class ERRS {
+    public static string OK                   = (char)OnError.NOTHING + "";
+    public static string invalidMail          = (char)OnError.EXIT    + "Invalid mail";
+    public static string invalidSession       = (char)OnError.EXIT    + "Invalid session";
+    public static string invalidUsername      = (char)OnError.EXIT    + "Invalid username";
+    public static string invalidToken         = (char)OnError.RETURN  + "Invalid Token";
+    public static string expiredSession       = (char)OnError.RESTART + "Session expired";
+    public static string userAlreadyExists    = (char)OnError.RESTART + "User already exists";
+    public static string userDoesntExist      = (char)OnError.RESTART + "User does not exist";
+    public static string mailAlreadyExists    = (char)OnError.RESTART + "Mail already registered";
+    public static string notAlphaNumerical    = (char)OnError.RESTART + "Name can only contain alphanumerical letters";
+    public static string notLoggedIn          = (char)OnError.EXIT    + "You need to be logged in to perform this action";
+    public static string authStepSkip         = (char)OnError.EXIT    + "Authentication step skipped";
+    public static string friendReqAlreadySent = (char)OnError.EXIT    + "Friend request already sent";
+    public static string tooManyAttempts      = (char)OnError.EXIT    + "Too many failed attempts";
+    public static string userNotFound         = (char)OnError.EXIT    + "User was not found";
+    public static string couldNotSendMail     = (char)OnError.EXIT    + "Could not send mail";
 }
 
 class TempUser {
@@ -138,8 +92,10 @@ class Program {
     }
 
     static void send_string(string responseString){
-        byte[] buffer = System.Text.Encoding.UTF8.GetBytes(responseString);
-        output.Write(buffer);
+	try {
+	    byte[] buffer = System.Text.Encoding.UTF8.GetBytes(responseString);
+	    output.Write(buffer);
+	} catch { Console.WriteLine("Failed to send response"); }
     }
 
     static void send_package(string package){
@@ -181,14 +137,26 @@ class Program {
 
     static bool chkRowColExists(string col, string val) {
 	var sql = $"SELECT COUNT(1) FROM clients WHERE {col}=@data";
-	using var cmd = new MySqlCommand(sql, sqlCon);
+	long exists = 0;
+	try {
+	    using var cmd = new MySqlCommand(sql, sqlCon);
+	    cmd.Parameters.AddWithValue("@data", val);
+	    exists = (long)cmd.ExecuteScalar();
+	} catch(Exception e) { Console.WriteLine(e); }
 
-	cmd.Parameters.AddWithValue("@data", val);
-	cmd.Prepare();
-	using MySqlDataReader rdr = cmd.ExecuteReader();
-	rdr.Read();
+	return exists == 1;
+    }
 
-	int exists = rdr.GetInt32(0);
+    static bool chkLoginHashExists(int id, int ip) {
+	var sql = $"SELECT COUNT(1) FROM auths WHERE id=@id AND ip=@ip";
+	long exists = 0;
+	try {
+	    using var cmd = new MySqlCommand(sql, sqlCon);
+	    cmd.Parameters.AddWithValue("@id", id);
+	    cmd.Parameters.AddWithValue("@ip", ip);
+	    exists = (long)cmd.ExecuteScalar();
+	} catch(Exception e) { Console.WriteLine(e); }
+
 	return exists == 1;
     }
 
@@ -200,15 +168,19 @@ class Program {
 	string[] ret = new string[3];
 
 	var sql = $"SELECT auth, totp, mail FROM clients WHERE name=@name";
-	using var cmd = new MySqlCommand(sql, sqlCon);
-	
-	cmd.Parameters.AddWithValue("@name", user);
-	cmd.Prepare();
-	using MySqlDataReader rdr = cmd.ExecuteReader();
-	rdr.Read();
-	ret[0] = rdr.GetString(0);
-	ret[1] = rdr.GetString(1);
-	ret[2] = rdr.GetString(2);
+
+	try {
+	    using var cmd = new MySqlCommand(sql, sqlCon);
+	    
+	    cmd.Parameters.AddWithValue("@name", user);
+	    cmd.Prepare();
+	    using MySqlDataReader rdr = cmd.ExecuteReader();
+	    rdr.Read();
+	    ret[0] = rdr.GetString(0);
+	    ret[1] = rdr.GetString(1);
+	    ret[2] = rdr.GetString(2);
+	    rdr.Close();
+	} catch (Exception e) { Console.WriteLine(e); }
 
 	return ret;
     }
@@ -230,10 +202,46 @@ class Program {
 	for(int i = 0; i < vars.Length; i++)
 	    ret.Add(rdr.GetString(i));
 
+	rdr.Close();
 	return ret.ToArray();
     }
 
-    static void CreateAccount(int ip, string user, string mail, string authHash, string totpHash) {
+    static void CreateLoginHash(int id, string authHash) {
+	string sql;
+	MySqlCommand cmd;
+	int ip = (int)request.RemoteEndPoint.Address.Address;
+
+	bool exists = chkLoginHashExists(id, ip);
+
+	if(exists) {
+	    try {
+		sql = $"UPDATE auths SET auth=@auth WHERE id=@id AND ip=@ip"; 
+
+		cmd = new MySqlCommand(sql, sqlCon);
+		cmd.Parameters.AddWithValue("@id", id);
+		cmd.Parameters.AddWithValue("@ip", ip);
+		cmd.Parameters.AddWithValue("@auth", authHash);
+
+		cmd.Prepare();
+		cmd.ExecuteNonQuery();
+	    } catch(Exception e) { Console.WriteLine(e); }
+
+	} else {
+	    try {
+		sql = $"INSERT INTO auths(id, ip, auth) VALUES(@id, @ip, @auth)"; 
+
+		cmd = new MySqlCommand(sql, sqlCon);
+		cmd.Parameters.AddWithValue("@id", id);
+		cmd.Parameters.AddWithValue("@ip", ip);
+		cmd.Parameters.AddWithValue("@auth", authHash);
+
+		cmd.Prepare();
+		cmd.ExecuteNonQuery();
+	    } catch(Exception e) { Console.WriteLine(e); }
+	}
+    }
+
+    static void CreateAccount(string user, string mail, string authHash, string totpHash) {
 	MySqlCommand cmd;
 	string sql;
 
@@ -248,15 +256,7 @@ class Program {
 	cmd.ExecuteNonQuery();
 
 	int id = GetUserIDS(new string[] { user })[0];
-
-	sql = "INSERT INTO auths VALUES (@id, @ip, @auth)";
-	cmd = new MySqlCommand(sql, sqlCon);
-	cmd.Parameters.AddWithValue("@id", id);
-	cmd.Parameters.AddWithValue("@ip", ip);
-	cmd.Parameters.AddWithValue("@auth", authHash);
-
-	cmd.Prepare();
-	cmd.ExecuteNonQuery();
+	CreateLoginHash(id, authHash);
     }
 
     static string GetCookieAuth(int ip, string user) {
@@ -295,10 +295,6 @@ class Program {
     }
 
     static string get_pkg(string package){
-        // This does some of the raw checking to see that nothing is wrong with the 
-        // Package that the user is requesting (for example the user doing something like ..
-        // Which would allow them to download random files on the server)
-        // Or somehow sending blankspaces or just simply a package that doesnt exist
         Console.WriteLine(request.Headers["type"]);
         Console.WriteLine("Package name : " + package);
         string full_path = Path.GetFullPath("packages/" + package);
@@ -346,6 +342,7 @@ class Program {
     }
 
     static string SendConfirmationMail(string user, string mail, string token) {
+	return ERRS.OK;
 	try {
 	    var message = new MimeMessage();
 	    message.From.Add (new MailboxAddress("noreply", "noreply@basilisk.sh"));
@@ -366,21 +363,18 @@ class Program {
 	    }
 	} catch {
 	    sessions.Remove(user);
-	    return ERRS.CouldNotSendMail();
+	    return ERRS.couldNotSendMail;
 	}
 
-	return (char)OnError.NOTHING + "";
+	return ERRS.OK;
     }
 
     static string login_0() {
 	string? user;
 	user = request.Headers["User"];
 
-	if(chkInvalidHeader(user))
-	    return ERRS.InvalidUsername();
-
-	if(!chkRowColExists("name", user))
-	    return ERRS.UserDoesntExist();
+	if(chkInvalidHeader(user)) return ERRS.invalidUsername;
+	if(!chkRowColExists("name", user)) return ERRS.userDoesntExist;
 
 	string[] data = DataFromUsername(user, new string[] { "mail" });
 	string mail = data[0];
@@ -393,13 +387,14 @@ class Program {
 	TempUser tempUser = new TempUser();
 	tempUser.mail = mail;
 	tempUser.ip = ip;
+	tempUser.token = "1234";
 
 	SendConfirmationMail(user, mail, tempUser.token);
 
 	if(sessions.ContainsKey(user)) {
-	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip) {
-		return ERRS.UserAlreadyExists();
-	    }
+	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip)
+		return ERRS.userAlreadyExists;
+	    
 	    sessions[user] = tempUser;
 	} else {
 	    sessions.Add(user, tempUser);
@@ -414,17 +409,10 @@ class Program {
 	user = request.Headers["User"];
 	toke = request.Headers["Toke"];
 
-	if(chkInvalidHeader(user))
-	    return ERRS.UserAlreadyExists();
-
-	if(chkInvalidSession(user))
-	    return ERRS.InvalidSession();
-
-	if(chkInvalidAuthStep(sessions[user].loginStep, 1))
-	    return ERRS.AuthStepSkip();
-
-	if(chkExpiredSession(user))
-	    return ERRS.ExpiredSession();
+	if(chkInvalidHeader(user)) return ERRS.userAlreadyExists;
+	if(chkInvalidSession(user)) return ERRS.invalidSession;
+	if(chkInvalidAuthStep(sessions[user].loginStep, 1)) return ERRS.authStepSkip;
+	if(chkExpiredSession(user)) return ERRS.expiredSession;
 
 	Console.ForegroundColor = ConsoleColor.Cyan;
 	Console.WriteLine("COMPARING EMAIL TOKEN \"" + sessions[user].token + "\" WITH \"" + toke + "\"");
@@ -434,16 +422,16 @@ class Program {
 	    if(++sessions[user].attempts == 3) {
 		sessions.Remove(user);
 		Console.WriteLine("TOO MANY ATTEMPTS!");
-		return ERRS.TooManyAttempts();
+		return ERRS.tooManyAttempts;
 	    }
 
-	    return ERRS.InvalidToken();
+	    return ERRS.invalidToken;
 	}
 
 	sessions[user].attempts = 0;
 	sessions[user].loginStep++;
 
-	return (char)OnError.NOTHING + "";
+	return ERRS.OK;
     }
 
     static string login_2() {
@@ -451,17 +439,10 @@ class Program {
 	user = request.Headers["User"];
 	totp = request.Headers["Totp"];
 
-	if(chkInvalidHeader(user))
-	    return ERRS.UserAlreadyExists();
-
-	if(chkInvalidSession(user))
-	    return ERRS.InvalidSession();
-
-	if(chkInvalidAuthStep(sessions[user].loginStep, 2))
-	    return ERRS.AuthStepSkip();
-
-	if(chkExpiredSession(user))
-	    return ERRS.ExpiredSession();
+	if(chkInvalidHeader(user)) return ERRS.userAlreadyExists;
+	if(chkInvalidSession(user)) return ERRS.invalidSession;
+	if(chkInvalidAuthStep(sessions[user].loginStep, 2)) return ERRS.authStepSkip;
+	if(chkExpiredSession(user)) return ERRS.expiredSession;
 
 	string[] data = DataFromUsername(user, new string[] { "totp" });
 	string totpEncrypted = data[0];
@@ -476,12 +457,33 @@ class Program {
 	var code = totp_cmp.ComputeTotp();
 	bool ok = code == totp;
 
+	Console.WriteLine("Comparing: " + totp + " | " + code + " (" + (ok ? "CORRECT" : "INCORRECT") + ")");
+	
 	if(!ok) {
 	    if(++sessions[user].attempts == 3)
-		return ERRS.TooManyAttempts();
+		return ERRS.tooManyAttempts;
 
-	    return ERRS.InvalidToken();
+	    return ERRS.invalidToken;
 	}
+
+//	string cmpAuth = GetCookieAuth(ip, user);
+//	bool ok = BC.Verify(auth, cmpAuth);
+
+	Cookie authCookie = new Cookie();
+	authCookie.Expires = DateTime.UtcNow.AddYears(10);
+	authCookie.Name = "auth";
+	authCookie.Value = Gen128();
+
+	Cookie userCookie = new Cookie();
+	userCookie.Name = "user";
+	userCookie.Value = user;
+
+	response.Cookies.Add(authCookie);
+	response.Cookies.Add(userCookie);
+
+	string authHash = BC.HashPassword(authCookie.Value);
+	int id = GetUserIDS(new string[] { user })[0];
+	CreateLoginHash(id, authHash);
 
 	return (char)OnError.NOTHING + "";
     }
@@ -491,23 +493,12 @@ class Program {
 	user = request.Headers["User"];
 	mail = request.Headers["Mail"];
 
-	if(chkInvalidHeader(user))
-	    return ERRS.InvalidUsername();
-
-	if(chkInvalidHeader(mail))
-	    return ERRS.InvalidMail();
-
-	if(chkInvalidEmail(mail))
-	    return ERRS.InvalidMail();
-
-	if(chkIsNotAlphaNum(user))
-	    return ERRS.NotAlphaNumerical();
-
-	if(chkRowColExists("name", user))
-	    return ERRS.UserAlreadyExists();
-	
-	if(chkRowColExists("mail", mail))
-	    return ERRS.MailAlreadyExists();
+	if(chkInvalidHeader(user)) return ERRS.invalidUsername;
+	if(chkInvalidHeader(mail)) return ERRS.invalidMail;
+	if(chkInvalidEmail(mail)) return ERRS.invalidMail;
+	if(chkIsNotAlphaNum(user)) return ERRS.notAlphaNumerical;
+	if(chkRowColExists("name", user)) return ERRS.userAlreadyExists;
+	if(chkRowColExists("mail", mail)) return ERRS.mailAlreadyExists;
 
 	long ip = request.RemoteEndPoint.Address.Address;
 	Console.ForegroundColor = ConsoleColor.Cyan;
@@ -517,11 +508,12 @@ class Program {
 	TempUser tempUser = new TempUser();
 	tempUser.mail = mail;
 	tempUser.ip = ip;
-
+	tempUser.token = "1234";
+	
 	if(sessions.ContainsKey(user)) {
-	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip) {
-		return ERRS.UserAlreadyExists();
-	    }
+	    if(request.RemoteEndPoint.Address.Address != sessions[user].ip)
+		return ERRS.userAlreadyExists;
+
 	    sessions[user] = tempUser;
 	} else {
 	    sessions.Add(user, tempUser);
@@ -538,17 +530,10 @@ class Program {
 	user = request.Headers["User"];
 	toke = request.Headers["Toke"];
 
-	if(chkInvalidHeader(user))
-	    return ERRS.UserAlreadyExists();
-
-	if(chkInvalidSession(user))
-	    return ERRS.InvalidSession();
-
-	if(chkInvalidAuthStep(sessions[user].authStep, 1))
-	    return ERRS.AuthStepSkip();
-
-	if(chkExpiredSession(user))
-	    return ERRS.ExpiredSession();
+	if(chkInvalidHeader(user)) return ERRS.userAlreadyExists;
+	if(chkInvalidSession(user)) return ERRS.invalidSession;
+	if(chkInvalidAuthStep(sessions[user].authStep, 1)) return ERRS.authStepSkip;
+	if(chkExpiredSession(user)) return ERRS.expiredSession;
 
 	Console.ForegroundColor = ConsoleColor.Cyan;
 	Console.WriteLine("COMPARING EMAIL TOKEN \"" + sessions[user].token + "\" WITH \"" + toke + "\"");
@@ -558,10 +543,10 @@ class Program {
 	    if(++sessions[user].attempts == 3) {
 		sessions.Remove(user);
 		Console.WriteLine("TOO MANY ATTEMPTS!");
-		return ERRS.TooManyAttempts();
+		return ERRS.tooManyAttempts;
 	    }
 
-	    return ERRS.InvalidToken();
+	    return ERRS.invalidToken;
 	}
 
 	sessions[user].attempts = 0;
@@ -573,17 +558,10 @@ class Program {
 	string? user;
 	user = request.Headers["User"];
 
-	if(chkInvalidHeader(user))
-	    return ERRS.InvalidUsername();
-
-	if(chkInvalidSession(user))
-	    return ERRS.InvalidSession();
-
-	if(chkInvalidAuthStep(sessions[user].authStep, 2))
-	    return ERRS.AuthStepSkip();
-
-	if(chkExpiredSession(user))
-	    return ERRS.ExpiredSession();
+	if(chkInvalidHeader(user)) return ERRS.invalidUsername;
+	if(chkInvalidSession(user)) return ERRS.invalidSession;
+	if(chkInvalidAuthStep(sessions[user].authStep, 2)) return ERRS.authStepSkip;
+	if(chkExpiredSession(user)) return ERRS.expiredSession;
 
 	Console.ForegroundColor = ConsoleColor.Cyan;
 	Console.WriteLine("TOTP FOR \"" + user + "\"");
@@ -609,20 +587,11 @@ class Program {
 	user = request.Headers["User"];
 	totp = request.Headers["Totp"];
 
-	if(chkInvalidHeader(user))
-	    return ERRS.InvalidUsername();
-
-	if(chkInvalidHeader(totp))
-	    return ERRS.InvalidToken();
-
-	if(chkInvalidSession(user))
-	    return ERRS.InvalidSession();
-
-	if(chkInvalidAuthStep(sessions[user].authStep, 3))
-	    return ERRS.AuthStepSkip();
-
-	if(chkExpiredSession(user))
-	    return ERRS.ExpiredSession();
+	if(chkInvalidHeader(user)) return ERRS.invalidUsername;
+	if(chkInvalidHeader(totp)) return ERRS.invalidToken;
+	if(chkInvalidSession(user)) return ERRS.invalidSession;
+	if(chkInvalidAuthStep(sessions[user].authStep, 3)) return ERRS.authStepSkip;
+	if(chkExpiredSession(user)) return ERRS.expiredSession;
 
 	string totp_cmp = sessions[user].totp.ComputeTotp();
 	totp = totp.Replace(" ", "");
@@ -632,9 +601,9 @@ class Program {
 
 	if(!ok) {
 	    if(++sessions[user].attempts == 3)
-		return ERRS.TooManyAttempts();
+		return ERRS.tooManyAttempts;
 
-	    return ERRS.InvalidToken();
+	    return ERRS.invalidToken;
 	}
 
 	/* Generate 128 bit password and send to client as cookie */
@@ -661,7 +630,7 @@ class Program {
 	byte[] totpBytes = Base32Encoding.ToBytes(sessions[user].totpBase32);
 	string encrypt64 = Convert.ToBase64String(aes.EncryptEcb(totpBytes, PaddingMode.ANSIX923));
 
-	CreateAccount((int)sessions[user].ip, user, sessions[user].mail, authHash, encrypt64);
+	CreateAccount(user, sessions[user].mail, authHash, encrypt64);
 
 	sessions.Remove(user);
 	return (char)OnError.NOTHING + "";
@@ -670,20 +639,39 @@ class Program {
     static bool AutoLogin(out string outUser) {
 	string? user, auth;
 
-	user = request.Cookies["user"].Value;
-	auth = request.Cookies["auth"].Value;
+	outUser = null;
+	Cookie userCookie = request.Cookies["user"];
+	Cookie authCookie = request.Cookies["auth"];
 
+	if(userCookie == null)
+	    return false;
+
+	if(authCookie == null)
+	    return false;
+
+	user = userCookie.Value;
+	auth = authCookie.Value;
 	outUser = user;
+
+	Console.WriteLine("1");
 	if(chkInvalidHeader(user))
 	    return false;
 
+	Console.WriteLine("2");
 	if(chkInvalidHeader(auth))
 	    return false;
 
+	Console.WriteLine("3");
 	int ip = (int)request.RemoteEndPoint.Address.Address;
 	string cmpAuth = GetCookieAuth(ip, user);
 
-	bool ok = BC.Verify(auth, cmpAuth);
+	if(string.IsNullOrEmpty(cmpAuth))
+	    return false;
+
+	bool ok = false;
+	try {
+	    ok = BC.Verify(auth, cmpAuth);
+	} catch(Exception e) { Console.WriteLine(e); }
 
 	return ok;
     }
@@ -705,7 +693,9 @@ class Program {
 	rdr = cmd.ExecuteReader();
 	rdr.Read();
 
-	return rdr.GetInt32(0) == 1;
+	bool val = rdr.GetInt32(0) == 1;
+	rdr.Close();
+	return val;
     }
 
     static int[] GetUserIDS(string[] names) {
@@ -725,6 +715,17 @@ class Program {
 	return ret;
     }
 
+    static string NameFromID(int ID) {
+	string sql;
+	MySqlCommand cmd;
+	
+	sql = $"SELECT name FROM clients WHERE id=@id";
+	cmd = new MySqlCommand(sql, sqlCon);
+	cmd.Parameters.AddWithValue("@id", ID);
+
+	return (string)cmd.ExecuteScalar();
+    }
+
     static void AcceptFriendRequest(int sender, int recipient) {
 	string sql;
 	MySqlCommand cmd;
@@ -742,8 +743,10 @@ class Program {
 
     static string Befriend() {
 	bool loggedIn = AutoLogin(out var user);
-	if(!loggedIn)
-	    return ERRS.NotLoggedIn();
+	if(!loggedIn) {
+	    Console.WriteLine("Not logged in");
+	    return ERRS.notLoggedIn;
+	}
 
 	string? friend;
 	friend = request.Headers["Friend"];
@@ -760,7 +763,7 @@ class Program {
 	    senderID = IDs[0];
 	    recipientID = IDs[1];
 	} catch {
-	    return ERRS.UserNotFound();
+	    return ERRS.userNotFound;
 	}
 
 	/* Check if request already exists */
@@ -786,7 +789,7 @@ class Program {
 	    /* If same user sent same request more than once */
 	    if(user0 == senderID) {
 		Console.WriteLine("Request already sent");
-		return ERRS.FriendReqAlreadySent();
+		return ERRS.friendReqAlreadySent;
 	    }
 
 	    /* Create a friendship if both parties have sent a friend request to eachother */
@@ -809,16 +812,56 @@ class Program {
 	return (char)OnError.NOTHING + "0";
     }
 
-    static void listen(HttpListener listener){
+    static string ChkStatus() {
+    	bool loggedIn = AutoLogin(out var user);
+	if(!loggedIn)
+	    return ERRS.notLoggedIn;
+
+	// Get friend requests
+	string sql;
+	MySqlCommand cmd;
+
+	int ID = GetUserIDS(new string[] { user })[0];
+
+	sql = $"SELECT user0, type FROM friends WHERE user1=@id LIMIT 8";
+
+	string res = "0";
+
+	int[] reqIDs = new int[8];
+	int[] types = new int[8];
+	int count = 0;
+
+	try {
+	    cmd = new MySqlCommand(sql, sqlCon);
+	    cmd.Parameters.AddWithValue("@id", ID);
+
+	    using MySqlDataReader rdr = cmd.ExecuteReader();
+
+	    for(count = 0; rdr.Read(); count++) {
+		reqIDs[count] = rdr.GetInt32(0);
+		types[count]  = rdr.GetInt32(1);
+	    }
+	    rdr.Close();
+	} catch(Exception e) {Console.WriteLine(e);}
+
+	for(int i = 0; i < count; i++) {
+	    if(types[i] == (int)FriendType.REQUEST)
+		res += " + Friend request from \"" + NameFromID(reqIDs[i]) + "\"\n";
+	}
+
+	return res;
+    }
+
+    static void listen(HttpListener listener) {
 	context = listener.GetContext();
         request = context.Request;
         response = context.Response;
         output = response.OutputStream;
 
-	Console.WriteLine("test");
 	string? type = request.Headers["Type"];
 	string ret = (char)OnError.NOTHING + "Unknown type";
 
+	Console.WriteLine("TYPE_: " + type);
 	try {
 	    switch(type) {
 		case "auth_0": ret = auth_0(); break;
@@ -831,6 +874,7 @@ class Program {
 		case "login_2": ret = login_2(); break;
 
 		case "befriend": ret = Befriend(); break;
+		case "status"  : ret = ChkStatus(); break;
 		default: break;
 	    }
 	} catch {};
@@ -852,8 +896,8 @@ class Program {
 	sqlCon.Open();
 	Console.WriteLine($"MySQL Version { sqlCon.ServerVersion }");
 
-	int port = 8005;
-        listener.Prefixes.Add("http://192.168.10.189:" + port + "/");
+	int port = 8001;
+        listener.Prefixes.Add("http://*:" + port + "/");
         listener.Start();
 	
 	Console.WriteLine("Listening on port " + port);
